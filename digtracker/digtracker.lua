@@ -241,6 +241,12 @@ end
 windower.register_event('incoming text', function(original, modified, mode, restored)
     if not original or original == '' then return end
 
+    -- Only track dig results while riding a chocobo
+    local current_player = windower.ffxi.get_player()
+    if not current_player or current_player.status ~= 5 then
+        return
+    end
+
     local clean_text = clean_string(original)
 
     -------------------------------------------------------------------
