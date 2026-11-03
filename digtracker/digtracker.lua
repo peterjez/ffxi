@@ -1,6 +1,6 @@
 _addon.name     = 'DigTracker'
 _addon.author   = 'peterjez'
-_addon.version  = '3.2'
+_addon.version  = '3.3.0'
 _addon.commands = {'dt', 'digtracker'}
 
 -- Load Windower Libraries
@@ -37,17 +37,43 @@ end
 local stats_file_path = ('data/%s.lua'):format(character)
 local stats_file = files.new(stats_file_path)
 
+-- Supported digging currencies, in stable HUD and save-file order.
+local currency_order = {
+    'Conquest Points',
+    'Imperial Standing',
+    'Allied Notes',
+    'Bayld'
+}
+local currency_names = {
+    ['conquest points'] = 'Conquest Points',
+    ['imperial standing'] = 'Imperial Standing',
+    ['allied notes'] = 'Allied Notes',
+    ['bayld'] = 'Bayld'
+}
+
 -- Establish Default Local Stats State
 local persistent_stats = {
     total_digs = 0,
     successful_digs = 0,
     failed_digs = 0,
-    conquest_points = 0,
+    regional_currencies = {},
     current_skill = 0,
     digs_since_skillup = 0, -- Moved here to allow persistent tracking across logouts
     items = {},
     skillups = {}
 }
+
+-- Preserve lifetime CP from character files saved before regional currencies.
+local function migrate_stats()
+    if not persistent_stats.digs_since_skillup then
+        persistent_stats.digs_since_skillup = 0
+    end
+    if type(persistent_stats.regional_currencies) ~= 'table' then
+        persistent_stats.regional_currencies = {
+            ['Conquest Points'] = persistent_stats.conquest_points or 0
+        }
+    end
+end
 
 -- Load stats from flat file safely
 if stats_file:exists() then
@@ -56,10 +82,7 @@ if stats_file:exists() then
         local success, result = pcall(loaded_data)
         if success and type(result) == 'table' then
             persistent_stats = result
-            -- Structural safety migration for existing old files
-            if not persistent_stats.digs_since_skillup then
-                persistent_stats.digs_since_skillup = 0
-            end
+            migrate_stats()
         end
     end
 end
@@ -70,7 +93,7 @@ local session = {
     digs = 0,
     successes = 0,
     fails = 0,
-    conquest_points = 0,
+    regional_currencies = {},
     last_skill_interval = 0,
     items = {}
 }
@@ -84,18 +107,18 @@ local hud = texts.new(settings.hud)
 -- Surgically removes FFXI auto-translate and style bytes using decimal codes
 local function clean_string(str)
     if not str then return "" end
-    
+
     local cleaned = str
-    
+
     -- 1. Strip Windower's color tags (\127 followed by hex colors)
     cleaned = cleaned:gsub('\127%x%x%x%x%x%x%x', ''):gsub('\127', '')
-    
+
     -- 2. Strip FFXI auto-translate control byte sequences (\253\002\002....)
     cleaned = cleaned:gsub('\253\002\002%.%.%.%.', '') 
-    
+
     -- 3. Strip specific FFXI system and color control bytes using decimal codes:
     cleaned = cleaned:gsub('[\253\031\030\029\028\027\026\001\002\003\127]', '')
-    
+
     -- 4. Collapse duplicate spaces and trim the ends
     cleaned = cleaned:gsub('%s+', ' ')
     return cleaned:trim()
@@ -105,17 +128,26 @@ end
 local function save_data()
     -- Save XML Settings
     config.save(settings)
-    
+
     -- Save Flat Lua Stats
     local output = {}
     output[#output+1] = "return {"
     output[#output+1] = string.format("    total_digs = %d,", persistent_stats.total_digs)
     output[#output+1] = string.format("    successful_digs = %d,", persistent_stats.successful_digs)
     output[#output+1] = string.format("    failed_digs = %d,", persistent_stats.failed_digs)
-    output[#output+1] = string.format("    conquest_points = %d,", persistent_stats.conquest_points)
     output[#output+1] = string.format("    current_skill = %d,", persistent_stats.current_skill)
     output[#output+1] = string.format("    digs_since_skillup = %d,", persistent_stats.digs_since_skillup or 0)
-    
+
+    -- Write each currency in its own nested entry (and migrate old CP on save).
+    output[#output+1] = "    regional_currencies = {"
+    for _, currency in ipairs(currency_order) do
+        local amount = persistent_stats.regional_currencies[currency] or 0
+        if amount > 0 then
+            output[#output+1] = string.format("        [%q] = %d,", currency, amount)
+        end
+    end
+    output[#output+1] = "    },"
+
     -- Write items
     output[#output+1] = "    items = {"
     for item, count in pairs(persistent_stats.items) do
@@ -124,7 +156,7 @@ local function save_data()
         output[#output+1] = string.format("        ['%s'] = %d,", safe_item, count)
     end
     output[#output+1] = "    },"
-    
+
     -- Write skillups
     output[#output+1] = "    skillups = {"
     for _, val in ipairs(persistent_stats.skillups) do
@@ -132,45 +164,45 @@ local function save_data()
     end
     output[#output+1] = "    }"
     output[#output+1] = "}"
-    
+
     stats_file:write(table.concat(output, "\n"))
 end
 
 local function get_rates()
     local duration = math.max(1, os.time() - session.start_time)
     local hours = duration / 3600
-    
+
     local total = session.digs
     local success_rate = total > 0 and (session.successes / total) * 100 or 0
     local digs_per_hour = total / hours
     local success_per_hour = session.successes / hours
-    
+
     -- Decode our flat string list back into math values
     local skill_count = #persistent_stats.skillups
     local avg_interval = 0
     local best_interval = "N/A"
     local worst_interval = "N/A"
-    
+
     if skill_count > 1 then
         local total_intervals = 0
         local min_int = 999999
         local max_int = 0
-        
+
         for i = 2, skill_count do
             -- Decode "skill|interval|timestamp" format
             local parts = persistent_stats.skillups[i]:split('|')
             local interval = tonumber(parts[2]) or 0
-            
+
             total_intervals = total_intervals + interval
             if interval < min_int then min_int = interval end
             if interval > max_int then max_int = interval end
         end
-        
+
         avg_interval = total_intervals / (skill_count - 1)
         best_interval = tostring(min_int)
         worst_interval = tostring(max_int)
     end
-    
+
     local indicator = "---"
     local current_interval = persistent_stats.digs_since_skillup or 0
     if avg_interval > 0 and current_interval > 0 then
@@ -189,25 +221,28 @@ local function update_hud()
         hud:hide()
         return 
     end
-    
+
     local success_rate, digs_per_hour, success_per_hour, avg_interval, best_interval, worst_interval, indicator = get_rates()
-    
+
     local info = {}
     info[#info+1] = "== \\cs(0,255,255)Dig Tracker\\cr =="
     info[#info+1] = string.format("Digs (Session): %d | Failed: %d", session.digs, session.fails)
     info[#info+1] = string.format("Successes: %d (%.1f%%)", session.successes, success_rate)
     info[#info+1] = string.format("Speed: %.1f digs/hr | %.1f items/hr", digs_per_hour, success_per_hour)
-    
-    if session.conquest_points > 0 then
-        info[#info+1] = string.format("Conquest Points: %d (Total: %d)", session.conquest_points, persistent_stats.conquest_points)
+
+    for _, currency in ipairs(currency_order) do
+        local amount = session.regional_currencies[currency] or 0
+        if amount > 0 then
+            info[#info+1] = string.format('%s: %d (Total: %d)', currency, amount, persistent_stats.regional_currencies[currency] or 0)
+        end
     end
-    
+
     info[#info+1] = "--------------------------"
     info[#info+1] = string.format("Current Wing Skill: %s", persistent_stats.current_skill > 0 and tostring(persistent_stats.current_skill) or "Unknown")
     info[#info+1] = string.format("Digs Since Last Skill: %d", persistent_stats.digs_since_skillup or 0)
     info[#info+1] = string.format("Avg Interval: %.1f | Best/Worst: %s/%s", avg_interval, best_interval, worst_interval)
     info[#info+1] = string.format("Status: %s", indicator)
-    
+
     if settings.show_items then
         info[#info+1] = "--------------------------"
         info[#info+1] = "\\cs(255,255,100)Items Looted (Session):\\cr"
@@ -218,7 +253,7 @@ local function update_hud()
         end
         if not has_items then info[#info+1] = "  None" end
     end
-    
+
     hud:text(table.concat(info, '\n'))
     hud:show()
 end
@@ -226,11 +261,11 @@ end
 local function export_csv()
     local path = 'logs/dig_history.csv'
     local log_file = files.new(path)
-    
+
     if not log_file:exists() then
         log_file:write("Timestamp,Total Session Digs,Result,Item,Current Skill\n")
     end
-    
+
     local timestamp = os.date('%Y-%m-%d %H:%M:%S')
     return log_file, timestamp
 end
@@ -241,6 +276,12 @@ end
 windower.register_event('incoming text', function(original, modified, mode, restored)
     if not original or original == '' then return end
 
+    -- Only track dig results while riding a chocobo
+    local current_player = windower.ffxi.get_player()
+    if not current_player or current_player.status ~= 5 then
+        return
+    end
+
     local clean_text = clean_string(original)
 
     -------------------------------------------------------------------
@@ -250,42 +291,56 @@ windower.register_event('incoming text', function(original, modified, mode, rest
         session.digs = session.digs + 1
         session.fails = session.fails + 1
         persistent_stats.digs_since_skillup = (persistent_stats.digs_since_skillup or 0) + 1
-        
+
         persistent_stats.total_digs = persistent_stats.total_digs + 1
         persistent_stats.failed_digs = persistent_stats.failed_digs + 1
         save_data()
-        
+
         local log_file, ts = export_csv()
         log_file:append(string.format("%s,%d,Fail,None,%d\n", ts, session.digs, persistent_stats.current_skill))
-        
+
         update_hud()
         return
     end
 
     -------------------------------------------------------------------
-    -- Match 2: Successful Cache Find (Beastman Resources / CP)
+    -- Match 2: Regional Currency Rewards (Beastman caches and Bayld)
     -------------------------------------------------------------------
-    local cp_match = clean_text:match('You discover a cache of beastman resources and receive (%d+) conquest points!')
-    if cp_match then
-        local cp_amount = tonumber(cp_match)
-        
+    local reward_text = clean_text:lower()
+    local amount, name = reward_text:match('you discover a cache of beastman resources and receive%s+(%d+)%s+([%a%s]+)!')
+    local is_bayld = false
+    if not amount then
+        amount, name = reward_text:match('you receive%s+(%d+)%s+(bayld)!')
+        is_bayld = amount ~= nil
+    end
+
+    local currency = name and currency_names[name:match('^%s*(.-)%s*$')]
+    if currency then
+        local value = tonumber(amount)
+
         session.digs = session.digs + 1
         session.successes = session.successes + 1
         persistent_stats.digs_since_skillup = (persistent_stats.digs_since_skillup or 0) + 1
-        
-        session.conquest_points = session.conquest_points + cp_amount
-        persistent_stats.conquest_points = (persistent_stats.conquest_points or 0) + cp_amount
-        
-        session.items['Beastman Cache (CP)'] = (session.items['Beastman Cache (CP)'] or 0) + 1
-        
+
+        session.regional_currencies[currency] = (session.regional_currencies[currency] or 0) + value
+        persistent_stats.regional_currencies[currency] = (persistent_stats.regional_currencies[currency] or 0) + value
+
+        -- Retain the original CP item key for compatibility with old totals.
+        local short_name = currency == 'Conquest Points' and 'CP' or currency
+        local item_label = is_bayld and 'Bayld Reward' or ('Beastman Cache (' .. short_name .. ')')
+        session.items[item_label] = (session.items[item_label] or 0) + 1
+
         persistent_stats.total_digs = persistent_stats.total_digs + 1
         persistent_stats.successful_digs = persistent_stats.successful_digs + 1
-        persistent_stats.items['Beastman Cache (CP)'] = (persistent_stats.items['Beastman Cache (CP)'] or 0) + 1
+        persistent_stats.items[item_label] = (persistent_stats.items[item_label] or 0) + 1
         save_data()
-        
+
+        local csv_label = is_bayld
+            and string.format('Bayld Reward (%d Bayld)', value)
+            or string.format('Beastman Cache (%d %s)', value, short_name)
         local log_file, ts = export_csv()
-        log_file:append(string.format("%s,%d,Success,\"Beastman Cache (%d CP)\",%d\n", ts, session.digs, cp_amount, persistent_stats.current_skill))
-        
+        log_file:append(string.format('%s,%d,Success,"%s",%d\n', ts, session.digs, csv_label, persistent_stats.current_skill))
+
         update_hud()
         return
     end
@@ -296,24 +351,24 @@ windower.register_event('incoming text', function(original, modified, mode, rest
     local item_match = original:match('Obtained:%s*(.-)%.')
     if item_match then
         item_match = clean_string(item_match)
-        
+
         if item_match ~= "" then
             session.digs = session.digs + 1
             session.successes = session.successes + 1
             persistent_stats.digs_since_skillup = (persistent_stats.digs_since_skillup or 0) + 1
-            
+
             -- Track in session (displays in HUD)
             session.items[item_match] = (session.items[item_match] or 0) + 1
-            
+
             -- Track in persistent records safely
             persistent_stats.total_digs = persistent_stats.total_digs + 1
             persistent_stats.successful_digs = persistent_stats.successful_digs + 1
             persistent_stats.items[item_match] = (persistent_stats.items[item_match] or 0) + 1
             save_data()
-            
+
             local log_file, ts = export_csv()
             log_file:append(string.format("%s,%d,Success,\"%s\",%d\n", ts, session.digs, item_match, persistent_stats.current_skill))
-            
+
             update_hud()
             return
         end
@@ -326,17 +381,17 @@ windower.register_event('incoming text', function(original, modified, mode, rest
     if skill then
         local skill_num = tonumber(skill)
         local current_interval = persistent_stats.digs_since_skillup or 0
-        
+
         local serialized_skillup = string.format("%d|%d|%d", skill_num, current_interval, os.time())
         table.insert(persistent_stats.skillups, serialized_skillup)
-        
+
         persistent_stats.current_skill = skill_num
         session.last_skill_interval = current_interval
         persistent_stats.digs_since_skillup = 0
         save_data()
-        
+
         windower.add_to_chat(207, string.format('[DigTracker] Registered skill up to %d after %d digs!', skill_num, current_interval))
-        
+
         update_hud()
         return
     end
@@ -364,33 +419,33 @@ end)
 windower.register_event('addon command', function(...)
     local args = {...}
     local cmd = args[1] and args[1]:lower() or 'help'
-    
+
     if cmd == 'toggle' then
         settings.hud.visible = not settings.hud.visible
         save_data()
         update_hud()
         windower.add_to_chat(207, '[DigTracker] HUD Visibility toggled.')
-        
+
     elseif cmd == 'items' then
         settings.show_items = not settings.show_items
         save_data()
         update_hud()
         windower.add_to_chat(207, '[DigTracker] Item display toggled.')
-        
+
     elseif cmd == 'lock' then
         settings.hud.locked = not settings.hud.locked
         hud:draggable(not settings.hud.locked)
         save_data()
         windower.add_to_chat(207, '[DigTracker] HUD position ' .. (settings.hud.locked and 'Locked' or 'Unlocked') .. '.')
-        
+
     elseif cmd == 'reset' then
         local sub_cmd = args[2] and args[2]:lower() or 'all'
-        
+
         if sub_cmd == 'all' or sub_cmd == 'session' then
             session.digs = 0
             session.successes = 0
             session.fails = 0
-            session.conquest_points = 0
+            session.regional_currencies = {}
             session.items = {}
             session.start_time = os.time()
         end
@@ -400,7 +455,7 @@ windower.register_event('addon command', function(...)
                 total_digs = 0,
                 successful_digs = 0,
                 failed_digs = 0,
-                conquest_points = 0,
+                regional_currencies = {},
                 items = {},
                 skillups = {},
                 current_skill = 0,
@@ -408,10 +463,10 @@ windower.register_event('addon command', function(...)
             }
             save_data()
         end
-        
+
         windower.add_to_chat(207, string.format('[DigTracker] Reset executed for: %s', sub_cmd))
         update_hud()
-        
+
     else
         windower.add_to_chat(207, '===== Dig Tracker Commands =====')
         windower.add_to_chat(207, '//dt toggle : Show/Hide HUD overlay')
@@ -441,9 +496,7 @@ local function initialize_player_file()
             local success, result = pcall(loaded)
             if success and type(result) == 'table' then
                 persistent_stats = result
-                if not persistent_stats.digs_since_skillup then
-                    persistent_stats.digs_since_skillup = 0
-                end
+                migrate_stats()
             end
         end
     end
